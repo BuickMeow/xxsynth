@@ -22,7 +22,6 @@ struct App {
     
     is_running: bool,
     voice_count: u64,
-    logs: Vec<String>,
     tick_counter: u64, // 用于模拟动画
 }
 
@@ -32,9 +31,9 @@ impl Default for App {
             soundfont_path: "".to_string(),
             layer_limit: "100".to_string(),
             gain_level: "1.0".to_string(),
-            is_running: false,
+            // 启动软件时直接启动引擎
+            is_running: true,
             voice_count: 0,
-            logs: vec!["XSynth GUI 就绪...".to_string()],
             tick_counter: 0,
         }
     }
@@ -53,9 +52,7 @@ enum Message {
     SoundFontSelected(Option<String>),
     LayerLimitChanged(String),
     GainChanged(String),
-    ToggleEngine,
     Tick, 
-    Log(String),
 }
 
 // --- 3. 逻辑处理 (Update) ---
@@ -69,7 +66,6 @@ impl App {
             Message::SoundFontSelected(path) => {
                 if let Some(p) = path {
                     self.soundfont_path = p;
-                    self.logs.push(format!("已选择文件: {}", self.soundfont_path));
                 }
                 Task::none()
             }
@@ -81,16 +77,7 @@ impl App {
                 self.gain_level = val;
                 Task::none()
             }
-            Message::ToggleEngine => {
-                self.is_running = !self.is_running;
-                if self.is_running {
-                    self.logs.push("引擎已启动".to_string());
-                } else {
-                    self.logs.push("引擎已停止".to_string());
-                    self.voice_count = 0;
-                }
-                Task::none()
-            }
+            // 移除手动切换引擎的逻辑，软件启动即运行
             Message::Tick => {
                 // 简单的模拟逻辑，避免引入 rand 依赖导致报错
                 if self.is_running {
@@ -99,27 +86,15 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Log(msg) => {
-                if self.logs.len() > 100 {
-                    self.logs.remove(0);
-                }
-                self.logs.push(msg);
-                Task::none()
-            }
+            _ => Task::none(),
         }
     }
 
     // --- 4. 订阅逻辑 (Subscription) ---
     fn subscription(&self) -> Subscription<Message> {
         if self.is_running {
-            // 如果你在 iced 0.14 中找不到 time::every，或者 features 设置有问题，
-            // 这里可能会报错。为了稳妥起见，我暂时将其屏蔽。
-            // 只要 GUI 能跑起来，这个定时器不是核心功能。
-            /*
             iced::time::every(std::time::Duration::from_millis(100))
-                 .map(|_| Message::Tick)
-            */
-            Subscription::none()
+                .map(|_| Message::Tick)
         } else {
             Subscription::none()
         }
@@ -147,22 +122,6 @@ impl App {
             text(format!("当前复音数: {}", self.voice_count)).color([0.0, 1.0, 0.0])
         ].width(Length::Fill).align_y(iced::Alignment::Center);
 
-        let control_btn = button(
-            text(if self.is_running { "停止引擎" } else { "启动引擎" }).size(18)
-        )
-        .padding(10)
-        .width(Length::Fill)
-        .on_press(Message::ToggleEngine)
-        .style(if self.is_running { button::danger } else { button::primary });
-
-        let logs_content = self.logs.join("\n");
-        let logs = container(
-            scrollable(
-                text(logs_content).font(iced::font::Font::MONOSPACE).size(12)
-            )
-            .height(200)
-        ).style(container::bordered_box).padding(10);
-
         container(
             column![
                 text("XSynth 控制台").size(24),
@@ -170,9 +129,6 @@ impl App {
                 text("引擎参数").size(16).color(iced::Color::from_rgb(0.4, 0.6, 1.0)),
                 settings_section,
                 status_bar,
-                control_btn,
-                text("运行日志:").size(14),
-                logs
             ]
             .spacing(20)
             .padding(20)
