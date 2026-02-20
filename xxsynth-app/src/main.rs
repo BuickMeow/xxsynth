@@ -27,7 +27,8 @@ const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Choomaypiano.sf2";
 
 /// 是否开启多线程渲染 (ThreadCount::Auto 或 ThreadCount::None)
 /// 注意：Debug 模式下建议设为 None 防止爆音，Release 模式建议设为 Auto 提升性能。
-const MULTITHREADING: ThreadCount = ThreadCount::None;
+/// 节能酱认为，这个Auto不太好用，不如自己设定线程数，也有可能是我不会设
+const MULTITHREADING: ThreadCount = ThreadCount::Manual(12);
 
 /// 渲染窗口缓冲大小 (毫秒)
 const RENDER_WINDOW_MS: f64 = 10.0;
@@ -53,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     synth_cfg.format = format; 
     
     // 【配置：ignore_range 忽略范围】
-    // 假设我们忽略音符 < 21 (钢琴最低音 A0) 和 > 108 (钢琴最高音 C8) 的键位。
+    // 这里指的是忽略力度范围，当前设定为忽略 0 到 1 力度的音符
     // 如果不需要可以注释掉这行，默认是 0..=0（也就是不忽略任何正常音符）。
     synth_cfg.ignore_range = 0..=1;
 
