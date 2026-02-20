@@ -4,45 +4,80 @@ use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use xsynth_core::channel_group::{SynthEvent, SynthFormat};
-// 移除了多余的 KeyNoteEvent，直接使用 ChannelAudioEvent
-use xsynth_core::channel::{ChannelEvent, ChannelConfigEvent, ChannelAudioEvent};
-use xsynth_core::soundfont::{SampleSoundfont, SoundfontBase, SoundfontInitOptions};
+use xsynth_core::channel_group::{SynthEvent, SynthFormat, ThreadCount};
+use xsynth_core::channel::{ChannelEvent, ChannelConfigEvent, ChannelAudioEvent, ChannelInitOptions};
+use xsynth_core::soundfont::{SampleSoundfont, SoundfontBase, SoundfontInitOptions, Interpolator};
 use xsynth_core::{AudioStreamParams, ChannelCount};
 use xsynth_realtime::{RealtimeSynth, XSynthRealtimeConfig};
+
+// ==========================================
+// 全局配置区
+// 后续如果想分离，直接把这些常量移到 config.rs 即可
+// ==========================================
+
+/// UDP 监听端口
+const UDP_PORT: u16 = 44444;
+
+/// 需要创建的合成器通道总数
+/// 如果使用黑 MIDI，每个 Port 16 个通道，如果有 4 个 Port 就是 64 个通道。
+const TOTAL_CHANNELS: u32 = 64; 
+
+/// 默认加载的 SF2 音色库路径
+const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Choomaypiano.sf2";
+
+/// 是否开启多线程渲染 (ThreadCount::Auto 或 ThreadCount::None)
+/// 注意：Debug 模式下建议设为 None 防止爆音，Release 模式建议设为 Auto 提升性能。
+const MULTITHREADING: ThreadCount = ThreadCount::None;
+
+/// 渲染窗口缓冲大小 (毫秒)
+const RENDER_WINDOW_MS: f64 = 10.0;
+
+/// 音色库插值器算法 (Interpolator::Linear 或 Interpolator::Nearest 等)
+/// Linear（线性插值）能显著降低 CPU 占用，适合高负载或黑 MIDI 场景。
+const SF_INTERPOLATOR: Interpolator = Interpolator::Linear;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     println!("=== XXSynth 引擎已启动 ===");
-    println!("模式: Headless (UDP IPC 监听中...)");
+    println!("监听端口: {}", UDP_PORT);
+    println!("目标通道数: {}", TOTAL_CHANNELS);
 
-    // 1. 初始化 XSynth，配置为 256 通道
+    // 1. 初始化 XSynth 实时配置
     let mut synth_cfg = XSynthRealtimeConfig::default();
-    synth_cfg.render_window_ms = 10.0;
     
-    // 自定义 256 通道
-    let format = SynthFormat::Custom { channels: 256 };
+    synth_cfg.render_window_ms = RENDER_WINDOW_MS; 
+    synth_cfg.multithreading = MULTITHREADING;
+    
+    // 自定义通道数
+    let format = SynthFormat::Custom { channels: TOTAL_CHANNELS };
     synth_cfg.format = format; 
     
-    println!("正在初始化音频引擎 (256 通道) ...");
+    // 【配置：ignore_range 忽略范围】
+    // 假设我们忽略音符 < 21 (钢琴最低音 A0) 和 > 108 (钢琴最高音 C8) 的键位。
+    // 如果不需要可以注释掉这行，默认是 0..=0（也就是不忽略任何正常音符）。
+    synth_cfg.ignore_range = 0..=1;
+
+    println!("正在初始化音频引擎...");
     let mut synth = RealtimeSynth::open_with_default_output(synth_cfg);
 
     // 2. 加载并分配音色库
-    println!("正在加载和解析 SF2 音色库...");
+    println!("正在加载和解析 SF2 音色库: {}", DEFAULT_SOUNDFONT_PATH);
     
-    let audio_params = AudioStreamParams::new(44100, ChannelCount::Stereo); 
-    let sf_options = SoundfontInitOptions::default();
+    let audio_params = AudioStreamParams::new(48000, ChannelCount::Stereo); 
+    
+    let mut sf_options = SoundfontInitOptions::default();
+    // 应用顶部配置的插值器算法
+    sf_options.interpolator = SF_INTERPOLATOR;
     
     let soundfont = Arc::new(
-        SampleSoundfont::new("D:\\Soundfonts\\Choomaypiano.sf2", audio_params, sf_options)
+        SampleSoundfont::new(DEFAULT_SOUNDFONT_PATH, audio_params, sf_options)
             .expect("无法加载 SF2 文件，请检查文件路径是否正确")
     );
 
-    println!("正在为 256 个通道分配音色...");
-    for ch in 0..256 {
+    println!("正在为 {} 个通道分配音色...", TOTAL_CHANNELS);
+    for ch in 0..TOTAL_CHANNELS {
         let sf_base: Arc<dyn SoundfontBase> = soundfont.clone();
         
-        // 挂载音色库属于 Config 事件
         let event = SynthEvent::Channel(
             ch,
             ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(vec![sf_base]))
@@ -50,18 +85,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         synth.send_event(event);
     }
 
-    // 将初始化完毕的合成器放入 Arc<Mutex>，供接收线程使用
     let synth_arc = Arc::new(Mutex::new(synth));
 
-    // 3. 启动 UDP 监听 (对应 DLL 发送的 44444)
-    let socket = UdpSocket::bind("127.0.0.1:44444")?;
+    // 3. 启动 UDP 监听
+    let socket = UdpSocket::bind(format!("127.0.0.1:{}", UDP_PORT))?;
     socket.set_read_timeout(Some(Duration::from_millis(10)))?;
     
-    println!("引擎就绪！监听 127.0.0.1:44444 中。请在 Domino 中播放...");
+    println!("引擎就绪！请在 Domino 中播放...");
 
     let mut buf = [0u8; 4];
 
-    // 4. 高频接收来自 DLL 的数据并发送至合成器
     loop {
         if let Ok((size, _)) = socket.recv_from(&mut buf) {
             if size == 4 {
@@ -70,24 +103,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let data1 = buf[2];
                 let data2 = buf[3];
 
-                // 判断是否是 Channel 消息 (0x80 到 0xEF)
                 if status_byte >= 0x80 && status_byte < 0xF0 {
                     let original_channel = status_byte & 0x0F;
-                    
                     let target_channel = (port_index as u32 * 16) + original_channel as u32;
+                    
+                    // 防御性编程：避免接收到的 Target Channel 超出了我们初始化的总通道数
+                    if target_channel >= TOTAL_CHANNELS {
+                        continue;
+                    }
 
                     if let Ok(mut s) = synth_arc.lock() {
-                        // 构建实时的 Audio 事件：根据你提供的源码结构，直接使用 NoteOn 和 NoteOff
                         let channel_event = match status_byte & 0xF0 {
                             0x90 if data2 > 0 => {
-                                // Note On: 修复 E0308，直接使用原生的 u8 类型
                                 Some(ChannelEvent::Audio(ChannelAudioEvent::NoteOn {
                                     key: data1,
                                     vel: data2,
                                 }))
                             },
                             0x80 | 0x90 => {
-                                // Note Off: 修复 E0308，直接使用原生的 u8 类型
                                 Some(ChannelEvent::Audio(ChannelAudioEvent::NoteOff {
                                     key: data1,
                                 }))
