@@ -2010,6 +2010,7 @@ dependencies = [
  "serde_json",
  "xsynth-core",
  "xsynth-realtime",
+ "xsynth-soundfonts",
 ]
 
 [[package]]

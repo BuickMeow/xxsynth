@@ -4,7 +4,11 @@ use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use xsynth_core::channel_group::SynthFormat;
+use xsynth_core::channel_group::{SynthEvent, SynthFormat};
+// 移除了多余的 KeyNoteEvent，直接使用 ChannelAudioEvent
+use xsynth_core::channel::{ChannelEvent, ChannelConfigEvent, ChannelAudioEvent};
+use xsynth_core::soundfont::{SampleSoundfont, SoundfontBase, SoundfontInitOptions};
+use xsynth_core::{AudioStreamParams, ChannelCount};
 use xsynth_realtime::{RealtimeSynth, XSynthRealtimeConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,28 +22,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // 自定义 256 通道
     let format = SynthFormat::Custom { channels: 256 };
+    synth_cfg.format = format; 
     
     println!("正在初始化音频引擎 (256 通道) ...");
-    let synth = RealtimeSynth::open_with_default_output(synth_cfg);
-let synth_arc = Arc::new(Mutex::new(synth));
+    let mut synth = RealtimeSynth::open_with_default_output(synth_cfg);
 
-    // 测试阶段，请在这里强行加载一个 sf2 方便测试发声
-    /*{
-        let mut s = synth_arc.lock().unwrap();
-        // 调用 xsynth 的 api 加载音色库
-        s.load_soundfont("D:\\Soundfonts\\Choomaypiano.sf2"); 
-    }*/
+    // 2. 加载并分配音色库
+    println!("正在加载和解析 SF2 音色库...");
+    
+    let audio_params = AudioStreamParams::new(44100, ChannelCount::Stereo); 
+    let sf_options = SoundfontInitOptions::default();
+    
+    let soundfont = Arc::new(
+        SampleSoundfont::new("D:\\Soundfonts\\Choomaypiano.sf2", audio_params, sf_options)
+            .expect("无法加载 SF2 文件，请检查文件路径是否正确")
+    );
 
-    // 2. 启动 UDP 监听 (对应 DLL 发送的 44444)
+    println!("正在为 256 个通道分配音色...");
+    for ch in 0..256 {
+        let sf_base: Arc<dyn SoundfontBase> = soundfont.clone();
+        
+        // 挂载音色库属于 Config 事件
+        let event = SynthEvent::Channel(
+            ch,
+            ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(vec![sf_base]))
+        );
+        synth.send_event(event);
+    }
+
+    // 将初始化完毕的合成器放入 Arc<Mutex>，供接收线程使用
+    let synth_arc = Arc::new(Mutex::new(synth));
+
+    // 3. 启动 UDP 监听 (对应 DLL 发送的 44444)
     let socket = UdpSocket::bind("127.0.0.1:44444")?;
-    // 设置一点超时避免死锁，虽然 UDP 接收很快
     socket.set_read_timeout(Some(Duration::from_millis(10)))?;
     
     println!("引擎就绪！监听 127.0.0.1:44444 中。请在 Domino 中播放...");
 
     let mut buf = [0u8; 4];
 
-    // 3. 高频接收来自 DLL 的数据
+    // 4. 高频接收来自 DLL 的数据并发送至合成器
     loop {
         if let Ok((size, _)) = socket.recv_from(&mut buf) {
             if size == 4 {
@@ -52,19 +74,31 @@ let synth_arc = Arc::new(Mutex::new(synth));
                 if status_byte >= 0x80 && status_byte < 0xF0 {
                     let original_channel = status_byte & 0x0F;
                     
-                    // 核心：计算目标 256 通道 ID
                     let target_channel = (port_index as u32 * 16) + original_channel as u32;
 
-                    if let Ok(mut _s) = synth_arc.lock() {
-                        // 伪代码: 构造并发送 XSynth 接受的事件
-                        // Event API 取决于你拉取的 xsynth_core 的具体实现
-                        // let event = Event::Midi(target_channel, [status_byte, data1, data2]);
-                        // _s.send_event(event);
-                        
-                        // 由于未接入真正的 XSynth send_event，先打印日志查看映射是否正确：
-                        // 如果 Domino 非常密集地发声，建议注释掉打印，以免控制台卡顿
-                        println!("收到 DLL 数据 -> Port {} 映射至内部 Channel {}: [0x{:02X}, {}, {}]", 
-                           port_index + 1, target_channel, status_byte, data1, data2);
+                    if let Ok(mut s) = synth_arc.lock() {
+                        // 构建实时的 Audio 事件：根据你提供的源码结构，直接使用 NoteOn 和 NoteOff
+                        let channel_event = match status_byte & 0xF0 {
+                            0x90 if data2 > 0 => {
+                                // Note On: 修复 E0308，直接使用原生的 u8 类型
+                                Some(ChannelEvent::Audio(ChannelAudioEvent::NoteOn {
+                                    key: data1,
+                                    vel: data2,
+                                }))
+                            },
+                            0x80 | 0x90 => {
+                                // Note Off: 修复 E0308，直接使用原生的 u8 类型
+                                Some(ChannelEvent::Audio(ChannelAudioEvent::NoteOff {
+                                    key: data1,
+                                }))
+                            },
+                            _ => None,
+                        };
+
+                        if let Some(ce) = channel_event {
+                            let event = SynthEvent::Channel(target_channel, ce);
+                            s.send_event(event);
+                        }
                     }
                 }
             }
