@@ -3,6 +3,7 @@ mod config;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::process::Command;
 
 use xsynth_core::channel_group::{SynthEvent, SynthFormat, ThreadCount};
 use xsynth_core::channel::{ChannelEvent, ChannelConfigEvent, ChannelAudioEvent, ChannelInitOptions};
@@ -18,12 +19,16 @@ use xsynth_realtime::{RealtimeSynth, XSynthRealtimeConfig};
 /// UDP 监听端口
 const UDP_PORT: u16 = 44444;
 
+/// MIDI 虚拟端口名称 (用于写入注册表)
+const MIDI_PORT_NAME: &str = "midi7";
+
 /// 需要创建的合成器通道总数
 /// 如果使用黑 MIDI，每个 Port 16 个通道，如果有 4 个 Port 就是 64 个通道。
 const TOTAL_CHANNELS: u32 = 64; 
 
 /// 默认加载的 SF2 音色库路径
-const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Choomaypiano.sf2";
+//const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Choomaypiano.sf2";
+const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Starry Studio Grand v2.7~\\Presets\\A_Standard\\Studio Grand - Standard (No Hammer).sfz";
 
 /// 是否开启多线程渲染 (ThreadCount::Auto 或 ThreadCount::None)
 /// 注意：Debug 模式下建议设为 None 防止爆音，Release 模式建议设为 Auto 提升性能。
@@ -31,14 +36,28 @@ const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Choomaypiano.sf2";
 const MULTITHREADING: ThreadCount = ThreadCount::Manual(12);
 
 /// 渲染窗口缓冲大小 (毫秒)
-const RENDER_WINDOW_MS: f64 = 10.0;
+const RENDER_WINDOW_MS: f64 = 15.0;
 
 /// 音色库插值器算法 (Interpolator::Linear 或 Interpolator::Nearest 等)
 /// Linear（线性插值）能显著降低 CPU 占用，适合高负载或黑 MIDI 场景。
-const SF_INTERPOLATOR: Interpolator = Interpolator::Linear;
+const SF_INTERPOLATOR: Interpolator = Interpolator::Nearest;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
+
+    // --- 新增：自动写入注册表 ---
+    println!("正在尝试将虚拟 MIDI 端口 [{}] 写入注册表...", MIDI_PORT_NAME);
+    let reg_key = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32";
+    let status = Command::new("reg")
+        .args(&["add", reg_key, "/v", MIDI_PORT_NAME, "/t", "REG_SZ", "/d", "xxsynth_winmm.dll", "/f"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => println!("注册表写入成功！(端口: {})", MIDI_PORT_NAME),
+        _ => eprintln!("注册表写入失败！请确保你以【管理员身份】运行此程序。"),
+    }
+    // -----------------------------
+
     println!("=== XXSynth 引擎已启动 ===");
     println!("监听端口: {}", UDP_PORT);
     println!("目标通道数: {}", TOTAL_CHANNELS);
@@ -62,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut synth = RealtimeSynth::open_with_default_output(synth_cfg);
 
     // 2. 加载并分配音色库
-    println!("正在加载和解析 SF2 音色库: {}", DEFAULT_SOUNDFONT_PATH);
+    println!("正在加载和解析音色库: {}", DEFAULT_SOUNDFONT_PATH);
     
     let audio_params = AudioStreamParams::new(48000, ChannelCount::Stereo); 
     
@@ -72,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let soundfont = Arc::new(
         SampleSoundfont::new(DEFAULT_SOUNDFONT_PATH, audio_params, sf_options)
-            .expect("无法加载 SF2 文件，请检查文件路径是否正确")
+            .expect("无法加载 SF2 / SFZ 文件，请检查文件路径是否正确")
     );
 
     println!("正在为 {} 个通道分配音色...", TOTAL_CHANNELS);
