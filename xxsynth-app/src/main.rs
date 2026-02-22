@@ -1,160 +1,408 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // 隐藏控制台窗口
+
+mod audio;
 mod config;
 
-use std::net::UdpSocket;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use eframe::egui;
+use std::path::PathBuf;
 use std::process::Command;
+use std::fs;
 
-use xsynth_core::channel_group::{SynthEvent, SynthFormat, ThreadCount};
-use xsynth_core::channel::{ChannelEvent, ChannelConfigEvent, ChannelAudioEvent, ChannelInitOptions};
-use xsynth_core::soundfont::{SampleSoundfont, SoundfontBase, SoundfontInitOptions, Interpolator};
-use xsynth_core::{AudioStreamParams, ChannelCount};
-use xsynth_realtime::{RealtimeSynth, XSynthRealtimeConfig};
+use config::{InterpolatorWrapper, RealtimeConfig, RenderConfig};
+use audio::{spawn_audio_thread, AudioEngineHandle};
 
-// ==========================================
-// 全局配置区
-// 后续如果想分离，直接把这些常量移到 config.rs 即可
-// ==========================================
-
-/// UDP 监听端口
-const UDP_PORT: u16 = 44444;
-
-/// MIDI 虚拟端口名称 (用于写入注册表)
 const MIDI_PORT_NAME: &str = "midi7";
 
-/// 需要创建的合成器通道总数
-/// 如果使用黑 MIDI，每个 Port 16 个通道，如果有 4 个 Port 就是 64 个通道。
-const TOTAL_CHANNELS: u32 = 64; 
+#[derive(PartialEq)]
+enum Tab {
+    Soundfonts,
+    RealtimeSettings,
+    RenderSettings,
+}
 
-/// 默认加载的 SF2 音色库路径
-//const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Choomaypiano.sf2";
-const DEFAULT_SOUNDFONT_PATH: &str = "D:\\Soundfonts\\Starry Studio Grand v2.7~\\Presets\\A_Standard\\Studio Grand - Standard (No Hammer).sfz";
+struct XXSynthApp {
+    active_tab: Tab,
+    soundfonts: Vec<PathBuf>,
+    realtime_config: RealtimeConfig,
+    render_config: RenderConfig,
+    
+    // 运行状态
+    audio_handle: Option<AudioEngineHandle>,
+    status_message: String,
+}
 
-/// 是否开启多线程渲染 (ThreadCount::Auto 或 ThreadCount::None)
-/// 注意：Debug 模式下建议设为 None 防止爆音，Release 模式建议设为 Auto 提升性能。
-/// 节能酱认为，这个Auto不太好用，不如自己设定线程数，也有可能是我不会设
-const MULTITHREADING: ThreadCount = ThreadCount::Manual(12);
+// 本地持久化保存结构
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AppSettings {
+    soundfonts: Vec<PathBuf>,
+    udp_port: u16,
+    total_channels: u32,
+    render_window_ms: f64,
+    thread_count: usize,
+    interpolator: u8,
+    ignore_velocity_min: u8,
+    ignore_velocity_max: u8,
+}
 
-/// 渲染窗口缓冲大小 (毫秒)
-const RENDER_WINDOW_MS: f64 = 15.0;
-
-/// 音色库插值器算法 (Interpolator::Linear 或 Interpolator::Nearest 等)
-/// Linear（线性插值）能显著降低 CPU 占用，适合高负载或黑 MIDI 场景。
-const SF_INTERPOLATOR: Interpolator = Interpolator::Nearest;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
-
-    // --- 新增：自动写入注册表 ---
-    println!("正在尝试将虚拟 MIDI 端口 [{}] 写入注册表...", MIDI_PORT_NAME);
-    let reg_key = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32";
-    let status = Command::new("reg")
-        .args(&["add", reg_key, "/v", MIDI_PORT_NAME, "/t", "REG_SZ", "/d", "xxsynth_winmm.dll", "/f"])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => println!("注册表写入成功！(端口: {})", MIDI_PORT_NAME),
-        _ => eprintln!("注册表写入失败！请确保你以【管理员身份】运行此程序。"),
+impl AppSettings {
+    fn load() -> Self {
+        if let Ok(data) = fs::read_to_string("xxsynth_settings.json") {
+            if let Ok(settings) = serde_json::from_str(&data) {
+                return settings;
+            }
+        }
+        // 默认值
+        Self {
+            soundfonts: vec![],
+            udp_port: 44444,
+            total_channels: 64,
+            render_window_ms: 15.0,
+            thread_count: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(12),
+            interpolator: 0,
+            ignore_velocity_min: 0,
+            ignore_velocity_max: 0,
+        }
     }
-    // -----------------------------
 
-    println!("=== XXSynth 引擎已启动 ===");
-    println!("监听端口: {}", UDP_PORT);
-    println!("目标通道数: {}", TOTAL_CHANNELS);
+    fn save(&self) {
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = fs::write("xxsynth_settings.json", data);
+        }
+    }
+}
 
-    // 1. 初始化 XSynth 实时配置
-    let mut synth_cfg = XSynthRealtimeConfig::default();
-    
-    synth_cfg.render_window_ms = RENDER_WINDOW_MS; 
-    synth_cfg.multithreading = MULTITHREADING;
-    
-    // 自定义通道数
-    let format = SynthFormat::Custom { channels: TOTAL_CHANNELS };
-    synth_cfg.format = format; 
-    
-    // 【配置：ignore_range 忽略范围】
-    // 这里指的是忽略力度范围，当前设定为忽略 0 到 1 力度的音符
-    // 如果不需要可以注释掉这行，默认是 0..=0（也就是不忽略任何正常音符）。
-    synth_cfg.ignore_range = 0..=1;
+impl XXSynthApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // 配置中文字体
+        Self::setup_custom_fonts(&cc.egui_ctx);
 
-    println!("正在初始化音频引擎...");
-    let mut synth = RealtimeSynth::open_with_default_output(synth_cfg);
+        // 自动写入注册表
+        Self::register_midi_port();
 
-    // 2. 加载并分配音色库
-    println!("正在加载和解析音色库: {}", DEFAULT_SOUNDFONT_PATH);
-    
-    let audio_params = AudioStreamParams::new(48000, ChannelCount::Stereo); 
-    
-    let mut sf_options = SoundfontInitOptions::default();
-    // 应用顶部配置的插值器算法
-    sf_options.interpolator = SF_INTERPOLATOR;
-    
-    let soundfont = Arc::new(
-        SampleSoundfont::new(DEFAULT_SOUNDFONT_PATH, audio_params, sf_options)
-            .expect("无法加载 SF2 / SFZ 文件，请检查文件路径是否正确")
-    );
-
-    println!("正在为 {} 个通道分配音色...", TOTAL_CHANNELS);
-    for ch in 0..TOTAL_CHANNELS {
-        let sf_base: Arc<dyn SoundfontBase> = soundfont.clone();
+        // 1. 加载本地设置
+        let settings = AppSettings::load();
         
-        let event = SynthEvent::Channel(
-            ch,
-            ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(vec![sf_base]))
-        );
-        synth.send_event(event);
+        let mut realtime_config = RealtimeConfig::default();
+        realtime_config.udp_port = settings.udp_port;
+        realtime_config.total_channels = settings.total_channels;
+        realtime_config.render_window_ms = settings.render_window_ms;
+        realtime_config.thread_count = settings.thread_count;
+        realtime_config.interpolator = if settings.interpolator == 1 { InterpolatorWrapper::Linear } else { InterpolatorWrapper::Nearest };
+        realtime_config.ignore_velocity_min = settings.ignore_velocity_min;
+        realtime_config.ignore_velocity_max = settings.ignore_velocity_max;
+
+        let mut app = Self {
+            active_tab: Tab::Soundfonts,
+            soundfonts: settings.soundfonts.clone(),
+            realtime_config: realtime_config.clone(),
+            render_config: RenderConfig::default(),
+            audio_handle: None,
+            status_message: "正在自动启动引擎...".to_string(),
+        };
+
+        // 2. 默认自动启动引擎
+        if app.soundfonts.is_empty() {
+            app.status_message = "警告：没有加载任何音色库，将不会有声音。".to_string();
+        }
+        match spawn_audio_thread(app.realtime_config.clone(), app.soundfonts.clone()) {
+            Ok(handle) => {
+                app.audio_handle = Some(handle);
+                app.status_message = format!("已自动启动引擎。监听 UDP 端口 {}", app.realtime_config.udp_port);
+            }
+            Err(e) => {
+                app.status_message = format!("自动启动失败: {}", e);
+            }
+        }
+
+        app
     }
 
-    let synth_arc = Arc::new(Mutex::new(synth));
+    fn setup_custom_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
 
-    // 3. 启动 UDP 监听
-    let socket = UdpSocket::bind(format!("127.0.0.1:{}", UDP_PORT))?;
-    socket.set_read_timeout(Some(Duration::from_millis(10)))?;
-    
-    println!("引擎就绪！请在 Domino 中播放...");
+        // 尝试加载 Windows 自带的微软雅黑字体
+        let font_path = "C:\\Windows\\Fonts\\msyh.ttc";
+        if let Ok(font_data) = std::fs::read(font_path) {
+            // 注意这里：egui 新版本要求传入 Arc 包裹的 FontData
+            fonts.font_data.insert(
+                "msyh".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(font_data)),
+            );
 
-    let mut buf = [0u8; 4];
+            // 将微软雅黑设置为首选字体
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                vec.insert(0, "msyh".to_owned());
+            }
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                vec.insert(0, "msyh".to_owned());
+            }
+        } else {
+            eprintln!("警告: 找不到微软雅黑字体 ({})，中文可能无法正常显示。", font_path);
+        }
 
-    loop {
-        if let Ok((size, _)) = socket.recv_from(&mut buf) {
-            if size == 4 {
-                let port_index = buf[0];
-                let status_byte = buf[1];
-                let data1 = buf[2];
-                let data2 = buf[3];
+        ctx.set_fonts(fonts);
+    }
 
-                if status_byte >= 0x80 && status_byte < 0xF0 {
-                    let original_channel = status_byte & 0x0F;
-                    let target_channel = (port_index as u32 * 16) + original_channel as u32;
-                    
-                    // 防御性编程：避免接收到的 Target Channel 超出了我们初始化的总通道数
-                    if target_channel >= TOTAL_CHANNELS {
-                        continue;
+    fn register_midi_port() {
+        println!("尝试将虚拟 MIDI 端口 [{}] 写入注册表...", MIDI_PORT_NAME);
+        let reg_key = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32";
+        let status = Command::new("reg")
+            .args(&["add", reg_key, "/v", MIDI_PORT_NAME, "/t", "REG_SZ", "/d", "xxsynth_winmm.dll", "/f"])
+            .status();
+
+        match status {
+            Ok(s) if s.success() => println!("注册表写入成功！(端口: {})", MIDI_PORT_NAME),
+            _ => eprintln!("注册表写入失败！请确保你以【管理员身份】运行此程序。"),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.audio_handle.is_some()
+    }
+}
+
+impl eframe::App for XXSynthApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 顶部导航栏
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.active_tab, Tab::Soundfonts, "🎹 音色库");
+                ui.selectable_value(&mut self.active_tab, Tab::RealtimeSettings, "\u{2699} 实时设置");
+                ui.selectable_value(&mut self.active_tab, Tab::RenderSettings, "🎬 渲染导出");
+            });
+        });
+
+        // 底部状态栏
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let status_color = if self.is_running() { 
+                    egui::Color32::from_rgba_unmultiplied(0, 200, 0, 255) 
+                } else { 
+                    egui::Color32::from_rgba_unmultiplied(200, 0, 0, 255) 
+                };
+                ui.colored_label(status_color, if self.is_running() { "● 正在运行" } else { "○ 已停止" });
+                ui.separator();
+                ui.label(&self.status_message);
+            });
+        });
+
+        // 中央内容区
+        egui::CentralPanel::default().show(ctx, |ui| {
+            match self.active_tab {
+                Tab::Soundfonts => self.ui_soundfonts(ui),
+                Tab::RealtimeSettings => self.ui_realtime(ui),
+                Tab::RenderSettings => self.ui_render(ui),
+            }
+        });
+    }
+}
+
+// === 以下为 UI 渲染逻辑分离 ===
+impl XXSynthApp {
+    fn ui_soundfonts(&mut self, ui: &mut egui::Ui) {
+        ui.heading("已加载的音色库 (SF2 / SFZ)");
+        ui.label("注意: 列表顺序即为加载顺序，上方的音色如果遇到相同的预设 / 乐器会覆盖下方的。");
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui.button("➕ 添加音色文件...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Soundfonts", &["sf2", "sfz"])
+                    .pick_file() 
+                {
+                    self.soundfonts.push(path);
+                }
+            }
+            if ui.button("\u{1F5D1} 清空列表").clicked() {
+                self.soundfonts.clear();
+            }
+        });
+
+        ui.add_space(10.0);
+
+        let mut to_remove = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, path) in self.soundfonts.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}.", i + 1));
+                    if ui.button("❌").clicked() {
+                        to_remove = Some(i);
                     }
+                    ui.label(egui::RichText::new(path.file_name().unwrap_or_default().to_string_lossy()).strong());
+                });
+                ui.label(egui::RichText::new(path.to_string_lossy()).small().weak());
+                ui.separator();
+            }
+        });
 
-                    if let Ok(mut s) = synth_arc.lock() {
-                        let channel_event = match status_byte & 0xF0 {
-                            0x90 if data2 > 0 => {
-                                Some(ChannelEvent::Audio(ChannelAudioEvent::NoteOn {
-                                    key: data1,
-                                    vel: data2,
-                                }))
-                            },
-                            0x80 | 0x90 => {
-                                Some(ChannelEvent::Audio(ChannelAudioEvent::NoteOff {
-                                    key: data1,
-                                }))
-                            },
-                            _ => None,
-                        };
+        if let Some(i) = to_remove {
+            self.soundfonts.remove(i);
+        }
+    }
 
-                        if let Some(ce) = channel_event {
-                            let event = SynthEvent::Channel(target_channel, ce);
-                            s.send_event(event);
-                        }
+    fn ui_realtime(&mut self, ui: &mut egui::Ui) {
+        ui.heading("实时播放参数");
+        ui.label("修改参数后点击下方【应用更改】即可重启引擎并保存到本地。");
+        ui.separator();
+
+        let is_running = self.is_running();
+
+        // 【修复 E0502】使用作用域限定对 self.realtime_config 的可变借用生命周期
+        {
+            let cfg = &mut self.realtime_config;
+
+            // 移除 add_enabled_ui 限制，让引擎运行时依然可以修改参数
+            egui::Grid::new("realtime_grid").num_columns(2).spacing([40.0, 10.0]).striped(true).show(ui, |ui| {
+                ui.label("UDP 监听端口:");
+                ui.add(egui::DragValue::new(&mut cfg.udp_port));
+                ui.end_row();
+
+                ui.label("总通道数:");
+                ui.add(egui::DragValue::new(&mut cfg.total_channels).range(16..=256));
+                ui.end_row();
+
+                ui.label("缓冲区大小 (ms):");
+                ui.add(egui::Slider::new(&mut cfg.render_window_ms, 1.0..=100.0).text("ms"));
+                ui.end_row();
+
+                ui.label("多线程数量:");
+                ui.horizontal(|ui| {
+                    let max_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16);
+                    ui.radio_value(&mut cfg.thread_count, 1, "单线程");
+                    ui.radio_value(&mut cfg.thread_count, 0, "自动");
+                    
+                    // 【修复未使用 mut 警告】去掉这里的 mut
+                    let is_custom = cfg.thread_count > 1;
+                    if ui.radio(is_custom, "自定义:").clicked() {
+                        if !is_custom { cfg.thread_count = max_threads / 2; }
+                    }
+                    if is_custom {
+                        ui.add(egui::DragValue::new(&mut cfg.thread_count).range(2..=max_threads));
+                    }
+                });
+                ui.end_row();
+
+                ui.label("插值算法:");
+                egui::ComboBox::from_id_salt("interp_combo")
+                    .selected_text(cfg.interpolator.to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut cfg.interpolator, InterpolatorWrapper::Nearest, "最近邻 (Nearest) - 极低CPU占用");
+                        ui.selectable_value(&mut cfg.interpolator, InterpolatorWrapper::Linear, "线性 (Linear) - 音质平滑");
+                    });
+                ui.end_row();
+
+                ui.label("忽略力度范围:");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut cfg.ignore_velocity_min).range(0..=127));
+                    ui.label("至");
+                    ui.add(egui::DragValue::new(&mut cfg.ignore_velocity_max).range(0..=127));
+                });
+                // 确保 min 不大于 max
+                if cfg.ignore_velocity_min > cfg.ignore_velocity_max {
+                    cfg.ignore_velocity_max = cfg.ignore_velocity_min;
+                }
+                ui.end_row();
+            });
+        } // `cfg` 的可变借用在这里结束
+
+        ui.add_space(20.0);
+        
+        ui.horizontal(|ui| {
+            // 应用更改按钮
+            if ui.add_sized([200.0, 40.0], egui::Button::new(egui::RichText::new("🔄 应用更改并重启").heading())).clicked() {
+                // 1. 停止旧引擎
+                if let Some(mut handle) = self.audio_handle.take() {
+                    handle.stop();
+                }
+
+                // 2. 保存设置到本地 JSON
+                // 此时直接使用 &self.realtime_config 即可，不再有可变借用的冲突
+                let cfg = &self.realtime_config;
+                let settings = AppSettings {
+                    soundfonts: self.soundfonts.clone(),
+                    udp_port: cfg.udp_port,
+                    total_channels: cfg.total_channels,
+                    render_window_ms: cfg.render_window_ms,
+                    thread_count: cfg.thread_count,
+                    interpolator: if cfg.interpolator == InterpolatorWrapper::Linear { 1 } else { 0 },
+                    ignore_velocity_min: cfg.ignore_velocity_min,
+                    ignore_velocity_max: cfg.ignore_velocity_max,
+                };
+                settings.save();
+                
+                // 3. 启动新引擎
+                match spawn_audio_thread(self.realtime_config.clone(), self.soundfonts.clone()) {
+                    Ok(handle) => {
+                        self.audio_handle = Some(handle);
+                        self.status_message = format!("已应用更改。监听 UDP 端口 {}", self.realtime_config.udp_port);
+                    }
+                    Err(e) => {
+                        self.status_message = format!("启动失败: {}", e);
                     }
                 }
             }
+
+            // 提供一个单独的停止按钮
+            if is_running {
+                ui.add_space(10.0);
+                if ui.add_sized([100.0, 40.0], egui::Button::new("⏹ 停止引擎")).clicked() {
+                    if let Some(mut handle) = self.audio_handle.take() {
+                        handle.stop();
+                    }
+                    self.status_message = "音频引擎已手动停止。".to_string();
+                }
+            }
+        });
+    }
+
+    fn ui_render(&mut self, ui: &mut egui::Ui) {
+        ui.heading("离线渲染 (MIDI -> WAV)");
+        ui.label("渲染功能正在开发中，即将接入 xsynth-render。");
+        ui.separator();
+
+        let cfg = &mut self.render_config;
+
+        ui.horizontal(|ui| {
+            ui.label("输入 MIDI:");
+            if ui.button("📂 选择").clicked() {
+                if let Some(path) = rfd::FileDialog::new().add_filter("MIDI", &["mid", "midi"]).pick_file() {
+                    cfg.midi_path = path.to_string_lossy().to_string();
+                }
+            }
+            ui.label(&cfg.midi_path);
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("输出 WAV:");
+            if ui.button("💾 保存").clicked() {
+                if let Some(path) = rfd::FileDialog::new().add_filter("WAV", &["wav"]).save_file() {
+                    cfg.output_path = path.to_string_lossy().to_string();
+                }
+            }
+            ui.label(&cfg.output_path);
+        });
+
+        ui.add_space(20.0);
+
+        if ui.button("🚀 开始渲染 (WIP)").clicked() {
+            self.status_message = "渲染功能尚未完全实装。".to_string();
         }
     }
+}
+
+fn main() -> eframe::Result<()> {
+    env_logger::init();
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([650.0, 550.0])
+            .with_title("XXSynth - Black MIDI Engine"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "xxsynth-app",
+        options,
+        Box::new(|cc| Ok(Box::new(XXSynthApp::new(cc)))),
+    )
 }

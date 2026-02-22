@@ -1,128 +1,83 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use xsynth_core::channel_group::ThreadCount;
+use xsynth_core::soundfont::Interpolator;
 
-// 提前为你规划好的数据结构，这部分代码保留，用于之后对接 GUI 和本地存档。
-// 即使目前处于 Headless 模式，依然可以使用这些结构体。
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppConfig {
-    pub soundfonts: Vec<SoundfontEntry>,
-    pub realtime: RealtimeConfig,
-    pub render: RenderConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            soundfonts: Vec::new(),
-            realtime: RealtimeConfig::default(),
-            render: RenderConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AudioChannels { Mono, Stereo }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThreadCount { None, Auto, Manual(usize) }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Interpolator { None, Nearest, Linear }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EnvelopeCurveType { Linear, Exponential }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SynthFormat {
-    Midi,
-    Custom { channels: u32 },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnvelopeOptions {
-    pub attack_curve: EnvelopeCurveType,
-    pub decay_curve: EnvelopeCurveType,
-    pub release_curve: EnvelopeCurveType,
-}
-
-impl Default for EnvelopeOptions {
-    fn default() -> Self {
-        Self {
-            attack_curve: EnvelopeCurveType::Exponential,
-            decay_curve: EnvelopeCurveType::Linear,
-            release_curve: EnvelopeCurveType::Linear,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SoundfontEntry {
-    pub enabled: bool,
-    pub path: PathBuf,
-    pub bank: Option<u32>,
-    pub preset: Option<u32>,
-    pub vol_envelope_options: EnvelopeOptions,
-    pub use_effects: bool,
-    pub interpolator: Interpolator,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// 实时配置结构体
+#[derive(Clone)]
 pub struct RealtimeConfig {
     pub render_window_ms: f64,
-    pub format: SynthFormat,
-    pub channel_threading: ThreadCount,
-    pub key_threading: ThreadCount,
-    pub ignore_range_start: u8,
-    pub ignore_range_end: u8,
-    pub ignore_range_exhausted: bool,
-    pub input_ports: Vec<Option<String>>, 
+    pub thread_count: usize, // 0 为 Auto
+    pub interpolator: InterpolatorWrapper,
+    pub udp_port: u16,
+    pub total_channels: u32,
+    pub ignore_velocity_min: u8,
+    pub ignore_velocity_max: u8,
 }
 
 impl Default for RealtimeConfig {
     fn default() -> Self {
         Self {
-            render_window_ms: 10.0,
-            format: SynthFormat::Custom { channels: 256 },
-            channel_threading: ThreadCount::Auto,
-            key_threading: ThreadCount::Auto,
-            ignore_range_start: 0,
-            ignore_range_end: 0,
-            ignore_range_exhausted: false,
-            input_ports: vec![None; 16],
+            render_window_ms: 15.0,
+            thread_count: 12, // 默认 12 线程
+            interpolator: InterpolatorWrapper::Nearest,
+            udp_port: 44444,
+            total_channels: 64,
+            ignore_velocity_min: 0,
+            ignore_velocity_max: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl RealtimeConfig {
+    pub fn get_thread_count(&self) -> ThreadCount {
+        if self.thread_count == 0 {
+            ThreadCount::Auto
+        } else {
+            ThreadCount::Manual(self.thread_count)
+        }
+    }
+
+    pub fn get_interpolator(&self) -> Interpolator {
+        match self.interpolator {
+            InterpolatorWrapper::Nearest => Interpolator::Nearest,
+            InterpolatorWrapper::Linear => Interpolator::Linear,
+        }
+    }
+}
+
+// 包装一下 Interpolator 以便在 UI 中使用
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum InterpolatorWrapper {
+    Nearest,
+    Linear,
+}
+
+impl ToString for InterpolatorWrapper {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Nearest => "最近邻 (Nearest) - 高性能".to_owned(),
+            Self::Linear => "线性 (Linear) - 平滑".to_owned(),
+        }
+    }
+}
+
+// 渲染配置结构体 (预留)
+#[derive(Clone)]
 pub struct RenderConfig {
-    pub input_midi: Option<PathBuf>,
-    pub output_path: PathBuf,
+    pub midi_path: String,
+    pub output_path: String,
     pub sample_rate: u32,
-    pub audio_channels: AudioChannels,
-    pub layers: u32,
-    pub channel_threading: ThreadCount,
-    pub key_threading: ThreadCount,
-    pub limiter: bool,
-    pub disable_fade_out: bool,
-    pub linear_envelope: bool,
-    pub interpolation: Interpolator,
+    pub use_limiter: bool,
+    pub layer_limit: u32,
 }
 
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
-            input_midi: None,
-            output_path: PathBuf::from("output.wav"),
+            midi_path: String::new(),
+            output_path: "output.wav".to_string(),
             sample_rate: 48000,
-            audio_channels: AudioChannels::Stereo,
-            layers: 32,
-            channel_threading: ThreadCount::Auto,
-            key_threading: ThreadCount::Auto,
-            limiter: true,
-            disable_fade_out: false,
-            linear_envelope: false,
-            interpolation: Interpolator::Linear,
+            use_limiter: true,
+            layer_limit: 0,
         }
     }
 }
