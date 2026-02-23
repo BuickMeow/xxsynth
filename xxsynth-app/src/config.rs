@@ -60,24 +60,36 @@ impl ToString for InterpolatorWrapper {
     }
 }
 
-// 渲染配置结构体 (预留)
+// 渲染配置结构体
 #[derive(Clone)]
 pub struct RenderConfig {
     pub midi_path: String,
     pub output_path: String,
     pub sample_rate: u32,
-    pub use_limiter: bool,
-    pub layer_limit: u32,
+    pub audio_channels: String,
+    pub layers: u32,
+    pub channel_threading: String,
+    pub key_threading: String,
+    pub apply_limiter: bool,
+    pub disable_fade_out: bool,
+    pub linear_envelope: bool,
+    pub interpolation: String,
 }
 
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
             midi_path: String::new(),
-            output_path: "output.wav".to_string(),
+            output_path: "out.wav".to_string(),
             sample_rate: 48000,
-            use_limiter: true,
-            layer_limit: 0,
+            audio_channels: "stereo".to_string(),
+            layers: 32,
+            channel_threading: "auto".to_string(),
+            key_threading: "auto".to_string(),
+            apply_limiter: false,
+            disable_fade_out: false,
+            linear_envelope: false,
+            interpolation: "linear".to_string(),
         }
     }
 }

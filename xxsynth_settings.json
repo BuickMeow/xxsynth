@@ -1,11 +1,11 @@
 {
   "soundfonts": [
-    "D:\\Soundfonts\\GeneralUser GS.sf2",
-    "D:\\Soundfonts\\THDrum.sf2"
+    "D:\\Soundfonts\\THDrum.sf2",
+    "D:\\Soundfonts\\GeneralUser GS.sf2"
   ],
   "udp_port": 44444,
   "total_channels": 64,
-  "render_window_ms": 15.0,
+  "render_window_ms": 10.0,
   "thread_count": 12,
   "interpolator": 0,
   "ignore_velocity_min": 0,

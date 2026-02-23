@@ -8,6 +8,7 @@ mod ui;       // 新增模块：UI 细节渲染
 use eframe::egui;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use config::{InterpolatorWrapper, RealtimeConfig, RenderConfig};
@@ -29,12 +30,16 @@ pub(crate) struct XXSynthApp {
     pub(crate) realtime_config: RealtimeConfig,
     pub(crate) render_config: RenderConfig,
     
-    // 运行状态
+    // 运行状态与脏标记
     pub(crate) audio_handle: Option<AudioEngineHandle>,
     pub(crate) status_message: String,
+    pub(crate) is_dirty: bool, // 是否有未保存/未重启的修改
     
-    // 进度条汇报句柄 (0.0 ~ 1.0)
+    // 加载/渲染进度状态
     pub(crate) load_progress: Arc<Mutex<f32>>,
+    pub(crate) is_rendering: Arc<AtomicBool>,
+    pub(crate) render_progress: Arc<Mutex<f32>>,
+    pub(crate) render_error: Arc<Mutex<Option<String>>>,
 }
 
 impl XXSynthApp {
@@ -64,7 +69,11 @@ impl XXSynthApp {
             render_config: RenderConfig::default(),
             audio_handle: None,
             status_message: "正在准备引擎...".to_string(),
+            is_dirty: false,
             load_progress: Arc::new(Mutex::new(0.0)),
+            is_rendering: Arc::new(AtomicBool::new(false)),
+            render_progress: Arc::new(Mutex::new(0.0)),
+            render_error: Arc::new(Mutex::new(None)),
         };
 
         // 2. 默认自动启动引擎
@@ -98,6 +107,9 @@ impl XXSynthApp {
             ignore_velocity_max: cfg.ignore_velocity_max,
         };
         settings.save();
+        
+        // 清除脏标记
+        self.is_dirty = false;
         
         // 3. 重置进度条
         if let Ok(mut p) = self.load_progress.lock() { 
@@ -178,8 +190,16 @@ impl XXSynthApp {
 // 主界面的全局 Layout 逻辑
 impl eframe::App for XXSynthApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let current_progress = *self.load_progress.lock().unwrap();
-        let is_loading = current_progress < 1.0;
+        // 捕获渲染子线程汇报的错误/完成消息
+        if let Ok(mut err) = self.render_error.lock() {
+            if let Some(msg) = err.take() {
+                self.status_message = msg;
+            }
+        }
+
+        let is_loading = *self.load_progress.lock().unwrap() < 1.0;
+        let is_rendering = self.is_rendering.load(Ordering::SeqCst);
+        let is_locked = is_loading || is_rendering;
 
         // 模态加载进度弹窗
         if is_loading {
@@ -194,7 +214,8 @@ impl eframe::App for XXSynthApp {
                     ui.vertical_centered(|ui| {
                         ui.heading("正在启动/重启引擎...");
                         ui.add_space(15.0);
-                        ui.add(egui::ProgressBar::new(current_progress)
+                        let pct = *self.load_progress.lock().unwrap();
+                        ui.add(egui::ProgressBar::new(pct)
                             .show_percentage()
                             .animate(true)
                             .desired_width(300.0));
@@ -203,11 +224,35 @@ impl eframe::App for XXSynthApp {
                     });
                     ui.add_space(15.0);
                 });
+        } 
+        // 模态渲染进度弹窗
+        else if is_rendering {
+            ctx.set_cursor_icon(egui::CursorIcon::Wait);
+            egui::Window::new("🎬 正在离线渲染")
+                .collapsible(false)
+                .resizable(false)
+                .title_bar(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(15.0);
+                    ui.vertical_centered(|ui| {
+                        ui.heading("🚀 正在将 MIDI 渲染至音频文件...");
+                        ui.add_space(15.0);
+                        let pct = *self.render_progress.lock().unwrap();
+                        ui.add(egui::ProgressBar::new(pct)
+                            .show_percentage()
+                            .animate(true)
+                            .desired_width(300.0));
+                        ui.add_space(15.0);
+                        ui.label("请勿关闭程序，渲染时间取决于乐曲复杂度和多线程配置。");
+                    });
+                    ui.add_space(15.0);
+                });
         }
 
         // 顶部导航栏
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.add_enabled_ui(!is_loading, |ui| {
+            ui.add_enabled_ui(!is_locked, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.active_tab, Tab::Soundfonts, "🎹 音色库");
                     ui.selectable_value(&mut self.active_tab, Tab::RealtimeSettings, "\u{2699} 实时设置");
@@ -218,14 +263,14 @@ impl eframe::App for XXSynthApp {
 
         // 底部状态栏
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            ui.add_enabled_ui(!is_loading, |ui| {
+            ui.add_enabled_ui(!is_locked, |ui| {
                 ui.horizontal(|ui| {
                     let status_color = if self.is_running() { 
                         egui::Color32::from_rgba_unmultiplied(0, 200, 0, 255) 
                     } else { 
                         egui::Color32::from_rgba_unmultiplied(200, 0, 0, 255) 
                     };
-                    ui.colored_label(status_color, if self.is_running() { "● 正在运行" } else { "○ 已停止" });
+                    ui.colored_label(status_color, if self.is_running() { "● 正在运行" } else { "● 已停止" });
                     ui.separator();
                     ui.label(&self.status_message);
                 });
@@ -234,7 +279,7 @@ impl eframe::App for XXSynthApp {
 
         // 中央内容区路由
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(!is_loading, |ui| {
+            ui.add_enabled_ui(!is_locked, |ui| {
                 match self.active_tab {
                     Tab::Soundfonts => self.ui_soundfonts(ui),
                     Tab::RealtimeSettings => self.ui_realtime(ui),
@@ -243,7 +288,7 @@ impl eframe::App for XXSynthApp {
             });
         });
 
-        if is_loading {
+        if is_locked {
             ctx.request_repaint();
         }
     }
@@ -254,7 +299,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([650.0, 550.0])
+            .with_inner_size([680.0, 580.0])
             .with_title("XXSynth"),
         ..Default::default()
     };
