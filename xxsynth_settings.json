@@ -1,6 +1,7 @@
 {
   "soundfonts": [
-    "D:\\Soundfonts\\GeneralUser GS.sf2"
+    "D:\\Soundfonts\\GeneralUser GS.sf2",
+    "D:\\Soundfonts\\THDrum.sf2"
   ],
   "udp_port": 44444,
   "total_channels": 64,

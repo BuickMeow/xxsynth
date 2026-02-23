@@ -34,11 +34,12 @@ impl AudioEngineHandle {
 pub fn spawn_audio_thread(
     config: RealtimeConfig,
     soundfonts: Vec<PathBuf>,
+    load_progress: Arc<Mutex<f32>>, // 用于向 UI 上报加载进度
 ) -> Result<AudioEngineHandle, String> {
     let is_running = Arc::new(AtomicBool::new(true));
     let is_running_clone = is_running.clone();
 
-    // 尝试提前绑定 UDP 端口，如果被占用直接报错，避免后面加载了半天音色才发现端口冲突
+    // 尝试提前绑定 UDP 端口，如果被占用直接报错
     let socket = UdpSocket::bind(format!("127.0.0.1:{}", config.udp_port))
         .map_err(|e| format!("无法绑定 UDP 端口 {}: {}", config.udp_port, e))?;
     // 设置超时，让 recv_from 不会永久阻塞，从而能响应停止信号
@@ -46,6 +47,9 @@ pub fn spawn_audio_thread(
 
     let thread_handle = thread::spawn(move || {
         println!("=== 后台音频线程已启动 ===");
+
+        // 初始化环境与参数，给予 5% 的基础进度
+        if let Ok(mut p) = load_progress.lock() { *p = 0.05; }
 
         // 1. 初始化 XSynth 配置
         let mut synth_cfg = XSynthRealtimeConfig::default();
@@ -64,12 +68,24 @@ pub fn spawn_audio_thread(
 
         let mut loaded_sfs: Vec<Arc<dyn SoundfontBase>> = Vec::new();
 
-        for sf_path in soundfonts {
-            println!("正在加载音色库: {}", sf_path.display());
-            match SampleSoundfont::new(&sf_path, audio_params, sf_options.clone()) {
-                Ok(sf) => loaded_sfs.push(Arc::new(sf)),
-                Err(e) => eprintln!("加载音色库失败 {}: {:?}", sf_path.display(), e),
+        // 动态分配剩下的 90% 进度用于音色加载阶段
+        let total_sfs = soundfonts.len();
+        if total_sfs > 0 {
+            for (i, sf_path) in soundfonts.into_iter().enumerate() {
+                println!("正在加载音色库: {}", sf_path.display());
+                match SampleSoundfont::new(&sf_path, audio_params, sf_options.clone()) {
+                    Ok(sf) => loaded_sfs.push(Arc::new(sf)),
+                    Err(e) => eprintln!("加载音色库失败 {}: {:?}", sf_path.display(), e),
+                }
+                
+                // 每加载完一个更新一次进度
+                if let Ok(mut p) = load_progress.lock() { 
+                    *p = 0.05 + (0.90 * ((i + 1) as f32 / total_sfs as f32)); 
+                }
             }
+        } else {
+            // 没有音色库的话跳过该阶段，直接拉到 95%
+            if let Ok(mut p) = load_progress.lock() { *p = 0.95; }
         }
 
         if !loaded_sfs.is_empty() {
@@ -87,6 +103,9 @@ pub fn spawn_audio_thread(
 
         let synth_arc = Arc::new(Mutex::new(synth));
         println!("引擎就绪！正在监听 UDP 端口 {}...", config.udp_port);
+
+        // 彻底就绪，进度条 100%
+        if let Ok(mut p) = load_progress.lock() { *p = 1.0; }
 
         let mut buf = [0u8; 4];
 
