@@ -30,7 +30,7 @@ impl XXSynthApp {
             
             // 保存并应用按钮：文本固定，仅在 is_dirty 时变色，使用默认尺寸以匹配其他按钮
             let btn_text = "🔄 保存并应用";
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).strong());
+            let mut btn = egui::Button::new(egui::RichText::new(btn_text));
             if self.is_dirty {
                 btn = btn.fill(egui::Color32::from_rgb(255, 127, 127));
             }

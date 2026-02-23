@@ -16,13 +16,13 @@ pub struct RealtimeConfig {
 impl Default for RealtimeConfig {
     fn default() -> Self {
         Self {
-            render_window_ms: 15.0,
-            thread_count: 12, // 默认 12 线程
+            render_window_ms: 10.0,
+            thread_count: 0, // 默认使用 Auto 模式
             interpolator: InterpolatorWrapper::Nearest,
             udp_port: 44444,
-            total_channels: 64,
+            total_channels: 16,
             ignore_velocity_min: 0,
-            ignore_velocity_max: 0,
+            ignore_velocity_max: 1,
         }
     }
 }
@@ -54,8 +54,8 @@ pub enum InterpolatorWrapper {
 impl ToString for InterpolatorWrapper {
     fn to_string(&self) -> String {
         match self {
-            Self::Nearest => "最近邻 (Nearest) - 高性能".to_owned(),
-            Self::Linear => "线性 (Linear) - 平滑".to_owned(),
+            Self::Nearest => "最近邻 (Nearest)".to_owned(),
+            Self::Linear => "线性 (Linear)".to_owned(),
         }
     }
 }
