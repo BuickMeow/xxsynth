@@ -19,15 +19,15 @@ pub const MOD_MIDIPORT: u16 = 1;
 
 #[repr(C)]
 pub struct MIDIOUTCAPSW {
-    pub wMid: u16,
-    pub wPid: u16,
-    pub vDriverVersion: u32,
-    pub szPname: [u16; 32],
-    pub wTechnology: u16,
-    pub wVoices: u16,
-    pub wNotes: u16,
-    pub wChannelMask: u16,
-    pub dwSupport: u32,
+    pub w_mid: u16,
+    pub w_pid: u16,
+    pub v_driver_version: u32,
+    pub sz_pname: [u16; 32],
+    pub w_technology: u16,
+    pub w_voices: u16,
+    pub w_notes: u16,
+    pub w_channel_mask: u16,
+    pub dw_support: u32,
 }
 // --------------------------------------------------------------------------
 
@@ -65,20 +65,20 @@ pub unsafe extern "system" fn modMessage(
         // 宿主获取设备信息（名字会显示在 Domino 里）
         MODM_GETDEVCAPS => {
             if let Some(caps) = (param1 as *mut MIDIOUTCAPSW).as_mut() {
-                caps.wMid = 0xFFFF; 
-                caps.wPid = 0xFFFF; 
-                caps.vDriverVersion = 0x0100; 
-                caps.wTechnology = MOD_MIDIPORT;
-                caps.wVoices = 256;
-                caps.wNotes = 256;
-                caps.wChannelMask = 0xFFFF;
-                caps.dwSupport = 0;
+                caps.w_mid = 0xFFFF; 
+                caps.w_pid = 0xFFFF; 
+                caps.v_driver_version = 0x0100; 
+                caps.w_technology = MOD_MIDIPORT;
+                caps.w_voices = 256;
+                caps.w_notes = 256;
+                caps.w_channel_mask = 0xFFFF;
+                caps.dw_support = 0;
 
                 // 名字例如 "XXSynth Port 1"
                 let name = format!("XXSynth Port {}\0", u_device_id + 1);
                 for (i, c) in name.encode_utf16().enumerate() {
                     if i < 32 {
-                        caps.szPname[i] = c;
+                        caps.sz_pname[i] = c;
                     }
                 }
             }

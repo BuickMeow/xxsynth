@@ -22,4 +22,4 @@ target/
 
 .fake
 .bak
-.xxsynth_settingsjson
+xxsynth_settings.json
